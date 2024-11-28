@@ -9,6 +9,7 @@ use std::{
 };
 
 use tokio::{fs, time::Instant};
+use tracing::{debug, error, info, instrument, warn};
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Config {
@@ -20,14 +21,51 @@ struct Config {
     interval: usize,
     #[serde(default = "IpFamily::default")]
     ip_family: IpFamily,
+    #[serde(default = "default_ipv4_api")]
+    ipv4_api: String,
+    #[serde(default = "default_ipv6_api")]
+    ipv6_api: String,
 }
 
 const fn default_interval() -> usize {
     const { 360 }
 }
 
+fn default_ipv4_api() -> String {
+    String::from("http://4.ipw.cn")
+}
+
+fn default_ipv6_api() -> String {
+    String::from("http://6.ipw.cn")
+}
+
+type JsonObject = serde_json::Map<String, serde_json::Value>;
+
+fn parse_result(response: &serde_json::Value) -> Result<&JsonObject> {
+    let result: Result<&JsonObject> = try {
+        if !response["success"].as_bool().unwrap() {
+            Err("not success")?;
+        }
+
+        match response.get("result").unwrap() {
+            serde_json::Value::Array(vec) if vec.is_empty() => Err("not exist")?,
+            serde_json::Value::Array(vec) => {
+                assert!(vec.len() == 1);
+                vec.first().unwrap().as_object().unwrap()
+            }
+            serde_json::Value::Object(map) => map,
+            _ => unreachable!("bad response"),
+        }
+    };
+
+    result.map_err(|e| {
+        let response = serde_json::to_string_pretty(response).unwrap();
+        format!("{e} response: {response}",).into()
+    })
+}
+
 #[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all_fields = "lowercase")]
+#[serde(rename_all = "lowercase")]
 enum IpFamily {
     V4,
     V6,
@@ -54,7 +92,9 @@ struct Service {
     cf_client: reqwest::Client,
 }
 
+// 返回Result的，外部负责log，返回Option的内部负责log
 impl Service {
+    #[instrument(level = "debug")]
     async fn new(config: Config) -> Result<Self> {
         let mut cf_headers = reqwest::header::HeaderMap::new();
         cf_headers.insert("Authorization", format!("Bearer {}", config.token).parse()?);
@@ -73,64 +113,53 @@ impl Service {
         })
     }
 
+    #[instrument(level = "debug", skip(self), ret)]
     async fn get_public_v4(&self) -> Option<Ipv4Addr> {
-        match self.config.ip_family {
-            IpFamily::Both | IpFamily::V4 => {
-                let result: Result<String> = try {
-                    let response = self.ip_client.get("http://4.ipw.cn").send().await?;
-                    let text = response.text().await?;
-                    log::debug!(target: "get_public_v4", "{text}");
-                    text
-                };
-                match result {
-                    Ok(text) => match text.parse::<Ipv4Addr>() {
-                        Ok(addr) => Some(addr),
-                        Err(_parse) => {
-                            log::warn!(target: "get_public_v4","it seem that ip address API is brokn? it response {text}");
-                            None
-                        }
-                    },
-                    Err(http) => {
-                        log::error!(
-                            "faild to get ipv4 address, it possible that the API address api is brokn: {http}"
-                        );
-                        None
-                    }
-                }
-            }
-            IpFamily::V6 => None,
+        if !self.config.ip_family.v4() {
+            return None;
         }
+
+        let api_url = &self.config.ipv4_api;
+        let result: Result<_> = try {
+            let response = self.ip_client.delete(api_url).send().await;
+            let respnse = response.map_err(|http| format!("http error: {http:?}"))?;
+
+            let text = respnse.text().await;
+            let text = text.map_err(|encode| format!("bad response: {encode:?}"))?;
+
+            let addr = text.parse();
+            let addr = addr.map_err(|parse| format!("bad response: {parse:?}"))?;
+
+            addr
+        };
+
+        result.map_err(|error| error!(error)).ok()
     }
 
+    #[instrument(level = "debug", skip(self), ret)]
     async fn get_public_v6(&self) -> Option<Ipv6Addr> {
-        match self.config.ip_family {
-            IpFamily::Both | IpFamily::V6 => {
-                let result: Result<String> = try {
-                    let response = self.ip_client.get("http://6.ipw.cn").send().await?;
-                    let text = response.text().await?;
-                    log::debug!(target: "get_public_v6", "{text}");
-                    text
-                };
-                match result {
-                    Ok(text) => match text.parse::<Ipv6Addr>() {
-                        Ok(addr) => Some(addr),
-                        Err(_parse) => {
-                            log::warn!(target: "get_public_v6","it seem that ip address API is brokn? it response {text}");
-                            None
-                        }
-                    },
-                    Err(http) => {
-                        log::error!(
-                            "faild to get ipv4 address, it possible that the address API is brokn, or your network dont support ipv6: {http}"
-                        );
-                        None
-                    }
-                }
-            }
-            IpFamily::V4 => None,
+        if !self.config.ip_family.v6() {
+            return None;
         }
+
+        let api_url = &self.config.ipv6_api;
+        let result: Result<_> = try {
+            let response = self.ip_client.delete(api_url).send().await;
+            let respnse = response.map_err(|http| format!("http error: {http:?}"))?;
+
+            let text = respnse.text().await;
+            let text = text.map_err(|encode| format!("bad response: {encode:?}"))?;
+
+            let addr = text.parse();
+            let addr = addr.map_err(|parse| format!("bad response: {parse:?}"))?;
+
+            addr
+        };
+
+        result.map_err(|error| error!(error)).ok()
     }
 
+    #[instrument(level = "debug", skip(self), ret)]
     async fn get_zone_id(&self) -> Result<String> {
         let resp = self
             .cf_client
@@ -142,17 +171,12 @@ impl Service {
             .await?;
 
         let resp = resp.json::<serde_json::Value>().await?;
-        log::debug!(target: "get_zone_id", "{}", serde_json::to_string_pretty(&resp)?);
+        debug!(resp = serde_json::to_string_pretty(&resp)?);
 
-        let success = resp["success"].as_bool().unwrap();
-        let result = resp["result"].as_array().unwrap();
-        if let (true, Some(zone)) = (success, result.first()) {
-            Ok(zone["id"].as_str().unwrap().to_owned())
-        } else {
-            Err(serde_json::to_string_pretty(&resp)?)?
-        }
+        parse_result(&resp).map(|result| result["id"].as_str().unwrap().to_owned())
     }
 
+    #[instrument(level = "debug", skip(self), ret)]
     async fn get_record_id(&self, zone_id: &str, r#type: &str) -> Result<String> {
         let resp = self
             .cf_client
@@ -167,28 +191,23 @@ impl Service {
             .await?;
 
         let resp = resp.json::<serde_json::Value>().await?;
-        log::debug!(target: "get_record_id", "{}", serde_json::to_string_pretty(&resp)?);
+        debug!(resp = serde_json::to_string_pretty(&resp)?);
 
-        let success = resp["success"].as_bool().unwrap();
-        let result = resp["result"].as_array().unwrap();
-        if let (true, Some(zone)) = (success, result.first()) {
-            Ok(zone["id"].as_str().unwrap().to_owned())
-        } else {
-            Err(serde_json::to_string_pretty(&resp)?)?
-        }
+        parse_result(&resp).map(|result| result["id"].as_str().unwrap().to_owned())
     }
 
+    #[instrument(level = "debug", skip(self), ret)]
     async fn create_dns_record(&self, zone_id: &str, r#type: &str) -> Result<(String, IpAddr)> {
         let addr: IpAddr = match r#type {
             "A" => self
                 .get_public_v4()
                 .await
-                .ok_or("faild to get ipv4 addr")?
+                .ok_or("failed to get ipv4 addr")?
                 .into(),
             "AAAA" => self
                 .get_public_v6()
                 .await
-                .ok_or("faild to get ipv6 addr")?
+                .ok_or("failed to get ipv6 addr")?
                 .into(),
             _ => unreachable!(),
         };
@@ -208,29 +227,33 @@ impl Service {
             .await?;
 
         let resp = resp.json::<serde_json::Value>().await?;
-        log::debug!(target: "create_dns_record", "{}", serde_json::to_string_pretty(&resp)?);
+        debug!(resp = serde_json::to_string_pretty(&resp)?);
 
-        if resp["success"].as_bool().unwrap() {
-            Ok((resp["result"]["id"].as_str().unwrap().to_owned(), addr))
-        } else {
-            Err(serde_json::to_string_pretty(&resp)?)?
-        }
+        parse_result(&resp).map(|result| (result["id"].as_str().unwrap().to_owned(), addr))
     }
 
+    #[instrument(level = "debug", skip(self), ret)]
     async fn get_or_create_record_id(&self, zone_id: &str, r#type: &str) -> Option<String> {
         match self.get_record_id(zone_id, r#type).await {
             Ok(id) => return Some(id),
-            Err(e) => log::warn!("it seems no {type} record dont exist?\n{e}",),
+            Err(e) => warn!(
+                target: "get_record_id",
+                "it seems no {type} record dont exist?\n{e}"
+            ),
         }
 
         match self.create_dns_record(zone_id, r#type).await {
             Ok((id, _)) => return Some(id),
-            Err(e) => log::warn!("faild to create {type} record, it will not be updated:\n{e}"),
+            Err(e) => warn!(
+                target: "create_dns_record",
+                "failed to create {type} record, it will not be updated:\n{e}"
+            ),
         }
 
         None
     }
 
+    #[instrument(level = "debug", skip(self), ret)]
     async fn get_dns_records(&self, zone_id: &str, recod_id: &str) -> Result<IpAddr> {
         let resp = self
             .cf_client
@@ -241,15 +264,17 @@ impl Service {
             .await?;
 
         let resp = resp.json::<serde_json::Value>().await?;
-        log::debug!(target: "get_dns_records", "{}", serde_json::to_string_pretty(&resp)?);
+        debug!(resp = serde_json::to_string_pretty(&resp)?);
 
-        if resp["success"].as_bool().unwrap() {
-            Ok(resp["result"]["content"].as_str().unwrap().parse()?)
-        } else {
-            Err(serde_json::to_string_pretty(&resp)?)?
-        }
+        let parse_content = |result: &JsonObject| {
+            let content = result["content"].as_str().unwrap();
+            let bad_content = |parse| format!("bad record content: {content}, {parse}");
+            Ok(content.parse().map_err(bad_content)?)
+        };
+        parse_result(&resp).and_then(parse_content)
     }
 
+    #[instrument(level = "debug", skip(self), ret)]
     async fn get_or_create_record_ip(
         &self,
         zone_id: &str,
@@ -258,17 +283,24 @@ impl Service {
     ) -> Option<IpAddr> {
         match self.get_dns_records(zone_id, record_id).await {
             Ok(addr) => return Some(addr),
-            Err(e) => log::warn!("it seems no {type} record dont exist?\n{e}",),
+            Err(e) => warn!(
+                target: "get_dns_records",
+                "it seems no {type} record dont exist?\n{e}",
+            ),
         }
 
         match self.create_dns_record(zone_id, r#type).await {
             Ok((_, addr)) => return Some(addr),
-            Err(e) => log::warn!("faild to create {type} record, it will not be updated:\n{e}"),
+            Err(e) => warn!(
+                target: "create_dns_record",
+                "failed to create {type} record, it will not be updated:\n{e}"
+            ),
         }
 
         None
     }
 
+    #[instrument(level = "debug", skip(self), ret)]
     async fn update_dns_record(
         &self,
         zone_id: &str,
@@ -292,15 +324,12 @@ impl Service {
             .await?;
 
         let resp = resp.json::<serde_json::Value>().await?;
-        log::debug!(target: "update_dns_record", "{}", serde_json::to_string_pretty(&resp)?);
+        debug!(resp = serde_json::to_string_pretty(&resp)?);
 
-        if resp["success"].as_bool().unwrap() {
-            Ok(())
-        } else {
-            Err(serde_json::to_string_pretty(&resp)?)?
-        }
+        parse_result(&resp).map(|_| ())
     }
 
+    #[instrument(level = "debug", skip(self), ret)]
     async fn idle(&mut self) {
         let interval = Duration::from_secs(self.config.interval as _);
         let elapsed = self.last_active.elapsed();
@@ -313,32 +342,35 @@ impl Service {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    run().await;
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
+    service().await;
 }
 
-async fn run() {
-    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
-
+#[instrument(level = "debug", ret)]
+async fn service() {
     let config_path = env::args().nth(1).unwrap_or_else(|| {
-        log::warn!("config file is not specified, use `config.json` as default");
+        warn!("config file is not specified, use `config.json` as default");
         "config.json".to_owned()
     });
+    info!(path = config_path, "loading config file");
     let config = fs::read_to_string(config_path)
         .await
-        .expect("faild to read config file");
-    let config: Config = serde_json::from_str(&config).expect("faild to deserialize config file");
-    log::info!("config: {}", serde_json::to_string_pretty(&config).unwrap());
+        .expect("failed to read config file");
+    let config: Config = serde_json::from_str(&config).expect("failed to deserialize config file");
+    info!(?config);
 
     let mut service = Service::new(config)
         .await
-        .expect("faild to start up service");
+        .expect("failed to start up service");
 
     let zone = service
         .get_zone_id()
         .await
-        .map_err(|e| log::error!("faild to get zone id: {e}"))
-        .expect("faild to get zone id");
-    log::info!("zone id got");
+        .map_err(|error| error!(error, "failed to get zone id"))
+        .expect("failed to get zone id");
+    info!(zone_id = zone, "zone id got");
 
     let v4_record_id = match service.config.ip_family.v4() {
         true => service.get_or_create_record_id(&zone, "A").await,
@@ -350,14 +382,17 @@ async fn run() {
         false => None,
     };
 
-    match (v4_record_id.is_some(), v6_record_id.is_some()) {
-        (true, true) => log::info!("Servicing ipv4 and ipv6 ddns"),
-        (true, false) => log::info!("Servicing ipv4 ddns"),
-        (false, true) => log::info!("Servicing ipv6 ddns"),
-        (false, false) => {
-            log::error!("both ipv4 and ipv6 record are not exist and faild to create, abort");
-            return;
+    match (&v4_record_id, &v6_record_id) {
+        (None, None) => {
+            error!("both ipv4 and ipv6 record are not exist and failed to create, abort");
         }
+        (None, Some(v6)) => info!(v6_record_id = v6, "servicing ipv6 ddns"),
+        (Some(v4), None) => info!(v4_record_id = v4, "servicing ipv4 ddns"),
+        (Some(v4), Some(v6)) => info!(
+            v4_record_id = v4,
+            v6_record_id = v6,
+            "servicing ipv4 and ipv6 ddns"
+        ),
     }
 
     loop {
@@ -366,13 +401,13 @@ async fn run() {
             && let Some(v4_record) = service.get_or_create_record_ip(&zone, record, "A").await
             && IpAddr::V4(v4_addr) != v4_record
         {
-            log::info!("cur: {v4_addr}, record: {v4_record}. updating...");
+            info!(cur = %v4_addr, record = %v4_record, "updating ipv4...");
             match service
                 .update_dns_record(&zone, record, "A", v4_addr.into())
                 .await
             {
-                Ok(_) => log::info!("success update"),
-                Err(e) => log::warn!("faild to update v4 record: {e}"),
+                Ok(_) => info!("success update"),
+                Err(error) => warn!(error, "failed to update v4 record"),
             }
         }
 
@@ -381,13 +416,13 @@ async fn run() {
             && let Some(v6_record) = service.get_or_create_record_ip(&zone, record, "AAAA").await
             && IpAddr::V6(v6_addr) != v6_record
         {
-            log::info!("cur: {v6_addr}, record: {v6_record}. updating...");
+            info!(cur = %v6_addr, record = %v6_record, "updating ipv6...");
             match service
-                .update_dns_record(&zone, record, "AAAA", v6_addr.into())
+                .update_dns_record(&zone, record, "A", v6_addr.into())
                 .await
             {
-                Ok(_) => log::info!("success update"),
-                Err(e) => log::warn!("faild to update v6 record: {e}"),
+                Ok(_) => info!("success update"),
+                Err(error) => warn!(error, "failed to update v6 record"),
             }
         }
 
