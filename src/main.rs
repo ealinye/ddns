@@ -1,5 +1,4 @@
 #![feature(try_blocks)]
-#![feature(async_closure)]
 #![feature(let_chains)]
 
 use std::{
@@ -365,45 +364,22 @@ async fn service() {
         .await
         .expect("failed to start up service");
 
-    let zone = service
-        .get_zone_id()
-        .await
-        .map_err(|error| error!(error, "failed to get zone id"))
-        .expect("failed to get zone id");
-    info!(zone_id = zone, "zone id got");
-
-    let v4_record_id = match service.config.ip_family.v4() {
-        true => service.get_or_create_record_id(&zone, "A").await,
-        false => None,
-    };
-
-    let v6_record_id = match service.config.ip_family.v6() {
-        true => service.get_or_create_record_id(&zone, "AAAA").await,
-        false => None,
-    };
-
-    match (&v4_record_id, &v6_record_id) {
-        (None, None) => {
-            error!("both ipv4 and ipv6 record are not exist and failed to create, abort");
-        }
-        (None, Some(v6)) => info!(v6_record_id = v6, "servicing ipv6 ddns"),
-        (Some(v4), None) => info!(v4_record_id = v4, "servicing ipv4 ddns"),
-        (Some(v4), Some(v6)) => info!(
-            v4_record_id = v4,
-            v6_record_id = v6,
-            "servicing ipv4 and ipv6 ddns"
-        ),
-    }
-
     loop {
-        if let Some(record) = v4_record_id.as_ref()
+        let zone = service
+            .get_zone_id()
+            .await
+            .map_err(|error| error!(error, "failed to get zone id"));
+
+        if let Ok(ref zone) = zone
+            && service.config.ip_family.v4()
+            && let Some(ref record) = service.get_or_create_record_id(zone, "A").await
             && let Some(v4_addr) = service.get_public_v4().await
-            && let Some(v4_record) = service.get_or_create_record_ip(&zone, record, "A").await
+            && let Some(v4_record) = service.get_or_create_record_ip(zone, record, "A").await
             && IpAddr::V4(v4_addr) != v4_record
         {
             info!(cur = %v4_addr, record = %v4_record, "updating ipv4...");
             match service
-                .update_dns_record(&zone, record, "A", v4_addr.into())
+                .update_dns_record(zone, record, "A", v4_addr.into())
                 .await
             {
                 Ok(_) => info!("success update"),
@@ -411,14 +387,16 @@ async fn service() {
             }
         }
 
-        if let Some(record) = v6_record_id.as_ref()
+        if let Ok(ref zone) = zone
+            && service.config.ip_family.v6()
+            && let Some(ref record) = service.get_or_create_record_id(zone, "AAAA").await
             && let Some(v6_addr) = service.get_public_v6().await
-            && let Some(v6_record) = service.get_or_create_record_ip(&zone, record, "AAAA").await
+            && let Some(v6_record) = service.get_or_create_record_ip(zone, record, "AAAA").await
             && IpAddr::V6(v6_addr) != v6_record
         {
             info!(cur = %v6_addr, record = %v6_record, "updating ipv6...");
             match service
-                .update_dns_record(&zone, record, "A", v6_addr.into())
+                .update_dns_record(zone, record, "AAAA", v6_addr.into())
                 .await
             {
                 Ok(_) => info!("success update"),
