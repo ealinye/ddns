@@ -22,8 +22,7 @@ struct Config {
     ip_family: IpFamily,
     #[serde(default = "default_ipv4_api")]
     ipv4_api: String,
-    #[serde(default = "default_ipv6_api")]
-    ipv6_api: String,
+    ipv6_api: Option<String>,
 }
 
 const fn default_interval() -> usize {
@@ -32,10 +31,6 @@ const fn default_interval() -> usize {
 
 fn default_ipv4_api() -> String {
     String::from("http://4.ipw.cn")
-}
-
-fn default_ipv6_api() -> String {
-    String::from("http://6.ipw.cn")
 }
 
 type JsonObject = serde_json::Map<String, serde_json::Value>;
@@ -141,9 +136,16 @@ impl Service {
             return None;
         }
 
-        let api_url = &self.config.ipv6_api;
+        match &self.config.ipv6_api {
+            Some(api_uri) => self.get_public_v6_from_api(api_uri).await,
+            None => self.get_public_v6_from_iface().await,
+        }
+    }
+
+    #[instrument(level = "debug", skip(self), ret)]
+    async fn get_public_v6_from_api(&self, api_uri: &str) -> Option<Ipv6Addr> {
         let result: Result<_> = try {
-            let response = self.ip_client.delete(api_url).send().await;
+            let response = self.ip_client.delete(api_uri).send().await;
             let respnse = response.map_err(|http| format!("http error: {http:?}"))?;
 
             let text = respnse.text().await;
@@ -156,6 +158,23 @@ impl Service {
         };
 
         result.map_err(|error| error!(error)).ok()
+    }
+
+    #[instrument(level = "debug", skip(self), ret)]
+    async fn get_public_v6_from_iface(&self) -> Option<Ipv6Addr> {
+        get_if_addrs::get_if_addrs()
+            .inspect_err(|error| tracing::error!(?error))
+            .into_iter()
+            .flatten()
+            .find_map(|get_if_addrs::Interface { name, addr }| match addr {
+                get_if_addrs::IfAddr::V6(get_if_addrs::Ifv6Addr { ip, netmask, .. })
+                    if netmask == Ipv6Addr::from_bits(u128::MAX) && ip != Ipv6Addr::LOCALHOST =>
+                {
+                    tracing::debug!(name, %ip, "got ipv6 from local ");
+                    Some(ip)
+                }
+                _ => None,
+            })
     }
 
     #[instrument(level = "debug", skip(self), ret)]
